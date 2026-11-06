@@ -106,6 +106,14 @@ function formState(document) {
     report.stale = formState(e.document); }
   // C. no status file at all
   { const e = await boot(null); report.none = formState(e.document); }
+  // E. runner locked or waiting on the owner: banner, and New request cannot be sent
+  const holdMsg = 'AI runner is paused. Please tell the office manager.';
+  { const e = await boot({ updated: iso(1000), runner_state: 'locked', message: holdMsg,
+      seats: seats(all.map(r => ({ id: r, enabled: true }))) });
+    report.locked = formState(e.document); }
+  { const e = await boot({ updated: iso(1000), runner_state: 'paused_for_review', message: holdMsg,
+      seats: seats(all.map(r => ({ id: r, enabled: true }))) });
+    report.reviewHold = formState(e.document); }
 
   // D. discard writes a metadata-only marker, then deletes the draft
   { const e = await boot(null);

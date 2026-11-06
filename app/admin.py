@@ -23,6 +23,7 @@ import json
 import os
 import re
 import secrets
+import subprocess
 import sys
 import threading
 import time
@@ -30,9 +31,11 @@ import urllib.error
 import webbrowser
 from collections import deque
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
 from urllib.parse import urlsplit, parse_qs
 
 import config
+import integrity
 import runner
 
 BIND_HOST = "127.0.0.1"          # never 0.0.0.0
@@ -131,6 +134,8 @@ def _json_files(folder):
     for fn in names:
         if fn.endswith(".json") and not fn.startswith("."):
             path = os.path.join(folder, fn)
+            if not runner.is_regular_file(path):
+                continue
             try:
                 with open(path, encoding="utf-8") as f:
                     data = json.load(f)
@@ -251,6 +256,9 @@ class AdminApp:
         self.calls = deque()                   # timestamps of recent paid test calls
         self.port = None
         self.allowed_hosts = set()
+        self.good_cfg = None                    # last config.json that loaded in this process
+        self.using_last_good = False
+        self.settings_detail = None
 
     # ---- sessions ----
     def new_session(self, timeout):
@@ -340,6 +348,148 @@ def _model_or_none(v):
     raise ApiError(400, "Model names can only use letters, numbers, dots, dashes, underscores, colons and slashes.")
 
 
+# =========================================================================== safety check (read-only; never changes permissions)
+_WRITE_LETTERS = {"F", "M", "W", "WD", "AD", "DC", "WEA", "WDAC", "DE"}
+
+
+def _safety_item(item_id, level, status, text):
+    return {"id": item_id, "level": level, "status": status, "text": text}
+
+
+def _has_write(perm):
+    for group in re.findall(r"\(([^)]*)\)", perm or ""):
+        letters = {part.strip().upper() for part in group.split(",") if part.strip()}
+        if letters & _WRITE_LETTERS:
+            return True
+    return False
+
+
+def _broad_identity(name):
+    n = (name or "").strip().lower()
+    if n in ("everyone", "users", "authenticated users"):
+        return True
+    return n.endswith("\\everyone") or n.endswith("\\users") or n.endswith("\\authenticated users")
+
+
+def _icacls(path):
+    """Return icacls stdout, or raise OSError. Does not change anything."""
+    try:
+        r = subprocess.run(["icacls", str(path)], capture_output=True, text=True, timeout=20,
+                           creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+    except (OSError, subprocess.SubprocessError) as e:
+        raise OSError("icacls could not be run") from e
+    if r.returncode != 0 or not (r.stdout or "").strip():
+        raise OSError("icacls failed")
+    return r.stdout
+
+
+def _advisory_windows(item_id, path, label, text):
+    writers, saw = [], False
+    norm_path = os.path.normcase(os.path.abspath(path))
+    for line in (text or "").splitlines():
+        if ":(" not in line:
+            continue
+        saw = True
+        left, perm = line.split(":(", 1)
+        perm = ":(" + perm
+        if line[:1].isspace():
+            ident = left.strip()
+        else:
+            raw_left = left.rstrip()
+            if os.path.normcase(raw_left).startswith(norm_path):
+                ident = raw_left[len(os.path.abspath(path)):].strip()
+            else:
+                ident = raw_left.strip().split()[-1] if raw_left.strip() else ""
+        if _broad_identity(ident) and _has_write(perm):
+            writers.append(ident)
+    if not saw:
+        return _safety_item(item_id, "advisory", "unknown",
+                            label + ": could not verify (the permission listing was not available).")
+    if writers:
+        return _safety_item(item_id, "advisory", "warn",
+                            label + " may be changeable by Everyone, Users, or Authenticated Users ("
+                            + ", ".join(writers) + "). Permissions were not changed.")
+    return _safety_item(item_id, "advisory", "pass",
+                        label + " does not grant write or modify to Everyone, Users, or Authenticated Users.")
+
+
+def _advisory_posix(item_id, label, mode):
+    if mode & 0o022:
+        return _safety_item(item_id, "advisory", "warn",
+                            "%s is writable by the group or by other users (mode %s). Permissions were not changed."
+                            % (label, oct(mode & 0o777)))
+    return _safety_item(item_id, "advisory", "pass", label + " is not writable by the group or by other users.")
+
+
+def _advisory(item_id, path, label, platform, icacls, stat_mode):
+    if not path or not os.path.exists(path):
+        return _safety_item(item_id, "advisory", "unknown",
+                            label + " was not found, so this check could not verify it.")
+    if platform == "nt":
+        try:
+            text = (icacls or _icacls)(path)
+        except (OSError, subprocess.SubprocessError):
+            return _safety_item(item_id, "advisory", "unknown",
+                                label + ": could not verify (the permission listing was not available).")
+        if not isinstance(text, str):
+            return _safety_item(item_id, "advisory", "unknown",
+                                label + ": could not verify (the permission listing was not available).")
+        return _advisory_windows(item_id, path, label, text)
+    try:
+        mode = stat_mode(path) if stat_mode else os.stat(path).st_mode
+    except OSError:
+        return _safety_item(item_id, "advisory", "unknown",
+                            label + ": could not verify (the permission listing was not available).")
+    return _advisory_posix(item_id, label, mode)
+
+
+def build_safety(root, app_directory=None, dashboard_path=None, platform=None, icacls=None, stat_mode=None):
+    """Pass/fail hard checks, plus best-effort permission warnings. Never changes permissions."""
+    platform = platform or os.name
+    app_directory = app_directory or config.app_dir()
+    items = []
+    app = str(Path(app_directory).resolve())
+    ws = str(Path(root).resolve())
+    if config.same_or_nested(app, ws):
+        items.append(_safety_item("app_outside_workspace", "hard", "fail",
+                                  "The program folder and the shared workspace overlap. Code must live outside the shared folder. The runner will not start until this is fixed."))
+    else:
+        items.append(_safety_item("app_outside_workspace", "hard", "pass",
+                                  "The program folder is outside the shared workspace."))
+    try:
+        config.check_location(root)
+        items.append(_safety_item("settings_outside_workspace", "hard", "pass",
+                                  "The settings folder is outside the shared workspace."))
+    except config.ConfigLocationError:
+        items.append(_safety_item("settings_outside_workspace", "hard", "fail",
+                                  "The settings folder is inside the shared workspace. The runner will not use it."))
+    if not config.config_path().exists():
+        items.append(_safety_item("config_permissions", "hard", "unknown",
+                                  "The settings file does not exist yet, so this check could not verify its permissions."))
+    else:
+        warns = config.permission_report()
+        if warns:
+            items.append(_safety_item("config_permissions", "hard", "fail", " ".join(warns)))
+        else:
+            items.append(_safety_item("config_permissions", "hard", "pass",
+                                      "The settings file is locked down so only this account should be able to read it."))
+    for item_id, path, label in (
+        ("perm_agents", os.path.join(root, "_agents"), "The _agents folder"),
+        ("perm_sops", os.path.join(root, "_sops"), "The _sops folder"),
+        ("perm_app", app_directory, "The program folder"),
+    ):
+        items.append(_advisory(item_id, path, label, platform, icacls, stat_mode))
+    if dashboard_path:
+        items.append(_advisory("perm_dashboard", dashboard_path, "The dashboard file", platform, icacls, stat_mode))
+    else:
+        items.append(_safety_item("perm_dashboard", "advisory", "unknown",
+                                  "The dashboard file path is not set, so this check could not verify it."))
+    items.append(_safety_item(
+        "manual_staff_account", "manual", "manual",
+        "Log in as a staff account and confirm you cannot edit _agents or the app folder."))
+    return items
+
+
 # =========================================================================== request handler
 class AdminHandler(BaseHTTPRequestHandler):
     app = None  # set by make_server
@@ -390,9 +540,19 @@ class AdminHandler(BaseHTTPRequestHandler):
 
     def _cfg(self):
         try:
-            return config.load(self.app.root)
-        except config.ConfigError as e:
+            cfg = config.load(self.app.root)
+        except config.ConfigLocationError as e:
             raise ApiError(500, str(e))
+        except config.ConfigError as e:
+            if self.app.good_cfg is not None:
+                self.app.using_last_good = True
+                self.app.settings_detail = str(e)
+                return self.app.good_cfg
+            raise ApiError(500, str(e))
+        self.app.good_cfg = cfg
+        self.app.using_last_good = False
+        self.app.settings_detail = None
+        return cfg
 
     def _session(self, cfg):
         token = None
@@ -451,6 +611,10 @@ class AdminHandler(BaseHTTPRequestHandler):
                 except ValueError:
                     days = 30
                 return self._send(200, compute_usage(self.app.root, days if 1 <= days <= 365 else 30, cfg))
+            if url.path == "/api/safety":
+                cfg = self._cfg()
+                self._require(cfg, False)
+                return self._send(200, {"items": build_safety(self.app.root, dashboard_path=cfg.get("dashboard_path"))})
             raise ApiError(404, "Not found.")
         except ApiError as e:
             self._fail(e.status, e.message, **e.extra)
@@ -531,7 +695,34 @@ class AdminHandler(BaseHTTPRequestHandler):
             "recent_models": cfg["recent_models"],
             "port": self.app.port,
             "session_timeout_minutes": cfg["session_timeout_minutes"],
+            "dashboard_path": cfg.get("dashboard_path"),
+            "hold": self._hold(cfg),
         }
+
+    def _change_report(self, cfg):
+        try:
+            saved = integrity.load_manifest()
+        except integrity.ManifestError as e:
+            return [], str(e), False
+        current = integrity.snapshot(self.app.root, cfg.get("dashboard_path") if cfg else None)
+        if saved is None:
+            return [], None, False
+        return integrity.diff(saved.get("files") or {}, current), None, True
+
+    def _hold(self, cfg):
+        """Owner-facing runner state. Detailed text stays here; the staff file gets a generic sentence."""
+        changes, manifest_error, baseline = self._change_report(cfg)
+        ev = config.evaluate_settings(self.app.root)
+        state, detail, note = ev["state"], ev["detail"], None
+        if state == "locked" and ev["recoverable"] and self.app.using_last_good:
+            state, note = "ready", config.LAST_GOOD_NOTE
+            detail = self.app.settings_detail
+        if manifest_error and state in ("ready", "first_run"):
+            state, detail = "locked", manifest_error
+        elif changes and state == "ready":
+            state, detail = "paused_for_review", "configuration changed, owner review needed"
+        return {"state": state, "detail": detail, "settings_note": note, "changes": changes,
+                "manifest_error": manifest_error, "baseline_present": baseline}
 
     # ---- POST handlers ----
     def login(self, cfg, data):
@@ -707,6 +898,30 @@ class AdminHandler(BaseHTTPRequestHandler):
             self.app.sessions = {t: s for t, s in self.app.sessions.items() if t == token}
         return {"ok": True}
 
+    def approve_manifest(self, cfg, data, token):
+        """Re-baseline the manifest from the files on disk. The browser confirms before it calls this."""
+        current = integrity.snapshot(self.app.root, cfg.get("dashboard_path"))
+        try:
+            integrity.save_manifest(current, self.app.root)
+        except config.ConfigError as e:
+            raise ApiError(500, str(e))
+        runner.log(self.app.root, "manifest_approved", files=len(current))
+        return self.state_payload(self._cfg())
+
+    def dashboard_path(self, cfg, data, token):
+        raw = data.get("dashboard_path")
+        if raw is None or (isinstance(raw, str) and not raw.strip()):
+            path = None
+        elif isinstance(raw, str) and len(raw.strip()) <= 500 and "\n" not in raw and "\r" not in raw:
+            path = raw.strip()
+        else:
+            raise ApiError(400, "Enter the full path to dashboard.html, or leave the box blank to clear it.")
+        with self.app.cfg_lock:
+            cfg = self._cfg()
+            cfg["dashboard_path"] = path
+            self._save(cfg)
+        return self.state_payload(self._cfg())
+
 
 POST_ROUTES = {
     "/api/login": AdminHandler.login,
@@ -717,6 +932,8 @@ POST_ROUTES = {
     "/api/seat": AdminHandler.seat,
     "/api/prices": AdminHandler.prices,
     "/api/set_pin": AdminHandler.set_pin,
+    "/api/manifest/approve": AdminHandler.approve_manifest,
+    "/api/dashboard_path": AdminHandler.dashboard_path,
 }
 
 
@@ -730,9 +947,13 @@ class _Server(ThreadingHTTPServer):
 
 def make_server(root, port=None):
     """Create (not start) the admin server, bound to 127.0.0.1 only. port=0 picks a free port."""
+    config.assert_separated(root)
     config.check_location(root)
     if port is None:
-        port = config.load(root)["admin_port"]
+        try:
+            port = config.load(root)["admin_port"]
+        except config.ConfigError:
+            port = config.DEFAULT_PORT
     app = AdminApp(root)
     handler = type("BoundAdminHandler", (AdminHandler,), {"app": app})
     srv = _Server((BIND_HOST, port), handler)
@@ -785,7 +1006,10 @@ def set_pin_interactive(root):
         if read_secret("Type it again: ") != a:
             print("The two entries did not match.")
             continue
-        cfg = config.load(root)
+        try:
+            cfg = config.load(root)
+        except config.ConfigMissingError:
+            cfg = config.default_config()
         cfg["pin"] = config.make_pin_record(a)
         config.save(cfg, root)
         print("PIN saved.")
@@ -796,27 +1020,51 @@ def set_pin_interactive(root):
 
 def main(argv=None):
     ap = argparse.ArgumentParser(description="Office AI Workspace admin page (this computer only).")
-    ap.add_argument("--root", default=".", help="the shared AI-Workspace folder")
+    ap.add_argument("--root", required=True, help="the shared workspace folder (must be outside this program folder)")
     ap.add_argument("--port", type=int, default=None, help="port (default: saved setting, else %d)" % config.DEFAULT_PORT)
     ap.add_argument("--set-pin", action="store_true", help="set or reset the PIN, then exit")
     ap.add_argument("--open", action="store_true", help="open the page in your browser (localhost only)")
     a = ap.parse_args(argv)
-    root = os.path.abspath(a.root)
+    try:
+        root = str(Path(a.root).resolve())
+    except OSError:
+        print("ERROR: the workspace path could not be resolved.", file=sys.stderr)
+        return 2
+    try:
+        config.assert_separated(root)
+    except config.LayoutError as e:
+        print("ERROR: " + str(e), file=sys.stderr)
+        return 2
     if not os.path.isdir(os.path.join(root, "_agents")):
-        print("ERROR: %s does not look like the AI-Workspace folder (no _agents folder)." % root, file=sys.stderr)
+        print("ERROR: %s does not look like a workspace (no _agents folder). "
+              "Point --root at the shared data folder, not the program folder." % root, file=sys.stderr)
         return 2
     try:
         config.check_location(root)
-        cfg = config.load(root)
-    except config.ConfigError as e:
+    except config.ConfigLocationError as e:
         print("ERROR: " + str(e), file=sys.stderr)
         return 2
+    cfg = None
+    try:
+        cfg = config.load(root)
+    except config.ConfigMissingError as e:
+        print("WARNING: " + str(e), file=sys.stderr)
+        print("The runner is paused until a settings file exists. Setting a PIN now creates a new one.", file=sys.stderr)
+        cfg = config.default_config()
+    except config.ConfigError as e:
+        print("WARNING: " + str(e), file=sys.stderr)
+        print("The admin page will still start so you can see the problem. "
+              "The runner processes nothing until the settings file is fixed.", file=sys.stderr)
     config.ensure_private()
     for w in config.permission_report():
         print("WARNING: " + w, file=sys.stderr)
     if a.set_pin:
+        if cfg is None:
+            print("ERROR: the settings file is damaged, so the PIN was not changed. "
+                  "Fix or delete that file, then run this again.", file=sys.stderr)
+            return 2
         return set_pin_interactive(root)
-    if not config.pin_is_set(cfg):
+    if cfg is not None and not config.pin_is_set(cfg):
         if not sys.stdin.isatty():
             print("No PIN is set yet. Run this once in a terminal:  python3 admin.py --root \"%s\" --set-pin" % root,
                   file=sys.stderr)
@@ -826,7 +1074,7 @@ def main(argv=None):
         if rc:
             return rc
         cfg = config.load(root)
-    port = a.port if a.port is not None else cfg["admin_port"]
+    port = a.port if a.port is not None else (cfg["admin_port"] if cfg else config.DEFAULT_PORT)
     if not 1 <= port <= 65535:
         print("ERROR: the port must be between 1 and 65535.", file=sys.stderr)
         return 2
@@ -940,8 +1188,8 @@ function el(tag,attrs,...kids){const e=document.createElement(tag);
   for(const[k,v]of Object.entries(attrs||{})){if(k==='class')e.className=v;else if(k.startsWith('on'))e.addEventListener(k.slice(2),v);else if(v!==false&&v!=null)e.setAttribute(k,v===true?'':v)}
   for(const c of kids.flat()){if(c==null)continue;e.append(c.nodeType?c:document.createTextNode(String(c)))}return e}
 const msg=(kind,text)=>el('div',{class:'msg '+kind},text);
-const S={csrf:null,tab:'conn',state:null,usage:null,days:30,testResults:null,testForm:{prompt:'',a:'',b:''},priceRows:null};
-const TABS=[['conn','Connection'],['test','Test models'],['seats','Seats'],['usage','Usage']];
+const S={csrf:null,tab:'conn',state:null,usage:null,days:30,testResults:null,testForm:{prompt:'',a:'',b:''},priceRows:null,safety:null};
+const TABS=[['conn','Connection'],['test','Test models'],['seats','Seats'],['usage','Usage'],['changes','Changes'],['safety','Safety check']];
 
 function flash(text,kind){const f=$('flash');f.replaceChildren(text?msg(kind||'ok',text):'');if(text)setTimeout(()=>{if(f.textContent===text)f.replaceChildren()},7000)}
 async function api(path,body){
@@ -971,10 +1219,19 @@ async function reload(){try{S.state=await api('/api/state');S.priceRows=null;ren
 async function loadUsage(){try{S.usage=await api('/api/usage?days='+S.days);render()}catch(e){flash(e.message,'bad')}}
 
 // ---------- shell ----------
+function holdBits(){
+  const h=S.state&&S.state.hold;if(!h)return [];
+  const out=[];
+  if(h.settings_note)out.push(msg('warn',h.settings_note));
+  if(h.state==='locked')out.push(msg('bad',h.detail||'The runner is locked and is not processing requests.'));
+  if(h.state==='paused_for_review')out.push(msg('warn','Configuration changed, owner review needed. Open Changes, review the list, and approve the current version when you are sure.'));
+  return out}
 function render(){
-  const nav=$('tabs');nav.replaceChildren(...TABS.map(([id,label])=>el('button',{role:'tab','aria-selected':S.tab===id,onclick:()=>{S.tab=id;if(id==='seats'||id==='usage')loadUsage();render()}},label)));
+  const nav=$('tabs');nav.replaceChildren(...TABS.map(([id,label])=>el('button',{role:'tab','aria-selected':S.tab===id,onclick:()=>{S.tab=id;if(id==='seats'||id==='usage')loadUsage();if(id==='safety')loadSafety();render()}},label)));
   const v=$('view');if(!S.state){v.replaceChildren();return}
-  v.replaceChildren(S.tab==='conn'?connView():S.tab==='test'?testView():S.tab==='seats'?seatsView():usageView())}
+  const body=S.tab==='conn'?connView():S.tab==='test'?testView():S.tab==='seats'?seatsView():S.tab==='changes'?changesView():S.tab==='safety'?safetyView():usageView();
+  v.replaceChildren(...holdBits(),body)}
+async function loadSafety(){try{S.safety=await api('/api/safety');render()}catch(e){flash(e.message,'bad')}}
 
 // ---------- 1. Connection ----------
 function connView(){
@@ -1118,6 +1375,42 @@ function pricesCard(){
         const prices={};for(const r of S.priceRows){if(!String(r.model).trim())continue;prices[String(r.model).trim()]={input_per_mtok:r.i===''?null:r.i,output_per_mtok:r.o===''?null:r.o}}
         try{S.state=await api('/api/prices',{prices});S.priceRows=null;if(S.tab==='usage')await loadUsage();else render();flash('Prices saved.')}
         catch(e){out.replaceChildren(msg('bad',e.message))}}},'Save prices')))}
+
+// ---------- 5. Changes ----------
+function changesView(){
+  const h=(S.state&&S.state.hold)||{}, rows=h.changes||[];
+  const path=el('input',{id:'dash-path',spellcheck:'false',autocomplete:'off',placeholder:'Full path to dashboard.html (optional)'});
+  path.value=S.state.dashboard_path||'';
+  const pout=el('div');
+  const when=ts=>ts||'-';
+  const hash=v=>v||'-';
+  const table=rows.length?el('div',{class:'tablewrap'},el('table',{},
+    el('thead',{},el('tr',{},el('th',{},'File'),el('th',{},'Change'),el('th',{class:'num'},'Size'),el('th',{},'Modified'),el('th',{},'Previous hash'),el('th',{},'Current hash'))),
+    el('tbody',{},rows.map(r=>el('tr',{},el('td',{},r.name),el('td',{},r.change),el('td',{class:'num'},r.size==null?'-':String(r.size)),el('td',{},when(r.modified)),el('td',{},hash(r.old_hash)),el('td',{},hash(r.new_hash))))))):
+    el('p',{class:'meta'},h.baseline_present?'No unapproved changes.':'No baseline yet. The runner saves one on its next check, or you can approve the current files now.');
+  const approve=el('button',{class:'primary',onclick:async()=>{
+    if(!confirm('Approve the current version of these files? Seats paused for this review will resume on the next check.'))return;
+    try{S.state=await api('/api/manifest/approve',{});S.safety=null;flash('Approved. The runner resumes paused seats on its next check.');render()}
+    catch(e){flash(e.message,'bad')}}},'Approve current version');
+  return el('div',{},el('div',{class:'card'},el('h2',{},'Changes'),
+    el('p',{class:'meta'},'The runner compares agent instructions, SOP files, and the dashboard file (if you set its path) with a saved baseline. A change pauses the affected seat until you approve it here. Shared files, including decision rights, pause every seat.'),
+    h.manifest_error?msg('bad',h.manifest_error):null,
+    table,
+    el('div',{class:'actions'},approve)),
+    el('div',{class:'card'},el('h2',{},'Dashboard file'),
+      el('p',{class:'meta'},'Optional. Point this at dashboard.html so a change to that file is noticed too. The file itself stays outside the shared workspace.'),
+      el('label',{for:'dash-path'},'Path'),path,pout,
+      el('div',{class:'actions'},el('button',{onclick:async()=>{
+        try{S.state=await api('/api/dashboard_path',{dashboard_path:path.value.trim()});pout.replaceChildren();flash('Dashboard path saved.')}
+        catch(e){pout.replaceChildren(msg('bad',e.message))}}},'Save path'))))}
+
+// ---------- 6. Safety check ----------
+function safetyView(){
+  if(!S.safety)return el('div',{class:'empty'},'Loading...');
+  const chip=s=>s==='pass'?'ok':s==='fail'?'bad':'warn';
+  return el('div',{class:'card'},el('h2',{},'Safety check'),
+    el('p',{class:'meta'},'Hard checks must pass before real use. Advisory checks are a best effort. Could not verify means this computer did not return enough information. Nothing on this tab changes permissions.'),
+    ...S.safety.items.map(it=>el('div',{style:'margin:10px 0'},el('span',{class:'chip '+chip(it.status)},it.status),' ',it.text,el('div',{class:'meta'},it.level))))}
 
 // ---------- start ----------
 $('go').addEventListener('click',doLogin);

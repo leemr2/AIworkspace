@@ -51,7 +51,7 @@ nav button[aria-selected=true]{color:var(--ink);border-bottom-color:var(--acc);f
   <div id="notices"></div>
   <div id="welcome" class="card">
     <strong>How this works</strong>
-    <p class="meta">Pick the shared <em>AI-Workspace</em> folder. Requests you write here are saved as small files in a role's inbox. The AI runner on the office machine turns them into <b>drafts</b>. Nothing is sent or published until a person approves it here. Never type patient names, birthdates, phone numbers, or record numbers.</p>
+    <p class="meta">Pick the shared workspace folder (the one with the role folders and <em>_agents</em>). This page does not need to live inside that folder. Requests you write here are saved as small files in a role's inbox. The AI runner on the office machine turns them into <b>drafts</b>. Nothing is sent or published until a person approves it here. Never type patient names, birthdates, phone numbers, or record numbers.</p>
   </div>
   <div id="app" class="hidden">
     <nav id="tabs" role="tablist"></nav>
@@ -91,25 +91,27 @@ async function loadStatus(){
   try{const ad=await dir(S.root,'_agents');S.status=ad?await readJSON(ad,'_public_status.json'):null}catch(_){S.status=null}
   if(!S.status||typeof S.status!=='object'||typeof S.status.seats!=='object'||!S.status.seats)S.status=null}
 function statusInfo(now){
-  const st=S.status;if(!st)return{paused:[],stale:false};
+  const st=S.status;if(!st)return{paused:[],stale:false,held:false};
   const t=Date.parse(st.updated);
   const stale=isNaN(t)||((now||Date.now())-t)>STALE_MS;
   const paused=Object.keys(st.seats).filter(rid=>S.agents[rid]&&st.seats[rid]&&st.seats[rid].enabled===false).sort();
-  return{paused,stale}}
+  const held=st.runner_state==='locked'||st.runner_state==='paused_for_review';
+  return{paused,stale,held}}
 function isPaused(rid){return statusInfo().paused.includes(rid)}
 function renderNotices(){
   const n=$('notices');const info=statusInfo();const kids=[];
+  if(info.held)kids.push(el('div',{class:'msg bad'},'AI runner is paused. Please tell the office manager.'));
   if(info.stale)kids.push(el('div',{class:'msg warn'},'The AI runner may be offline. Requests will wait in the queue until it is back.'));
   if(info.paused.length)kids.push(el('div',{class:'msg warn'},'Paused by an administrator: '+info.paused.map(r=>r+' – '+S.agents[r].role_title).join('; ')+'. You cannot send new requests to a paused seat.'));
   n.replaceChildren(...kids)}
 function applyPausedToForm(){
-  const sel=$('f-role');if(!sel)return;const paused=statusInfo().paused;
+  const sel=$('f-role');if(!sel)return;const info=statusInfo();const paused=info.paused;
   for(const o of Array.from(sel.options)){const p=paused.includes(o.value);const a=S.agents[o.value];
     o.disabled=p;o.textContent=o.value+' – '+(a?a.role_title:'')+(p?' (paused)':'')}
   const cur=Array.from(sel.options).find(o=>o.value===sel.value);
   if(!cur||cur.disabled){const ok=Array.from(sel.options).find(o=>!o.disabled);if(ok){sel.value=ok.value;sel.dispatchEvent(new Event('change'))}}
   const send=$('f-send');
-  if(send){const allPaused=!Array.from(sel.options).some(o=>!o.disabled);send.disabled=allPaused||phiScan(($('f-ins')||{}).value).length>0}}
+  if(send){const allPaused=!Array.from(sel.options).some(o=>!o.disabled);send.disabled=info.held||allPaused||phiScan(($('f-ins')||{}).value).length>0}}
 
 async function loadAgents(){
   const ad=await dir(S.root,'_agents');if(!ad)throw new Error('This folder has no _agents folder. Choose the AI-Workspace folder.');
@@ -125,7 +127,7 @@ async function gather(){
 // ---- UI ----
 const TABS=[['new','New request'],['review','Review drafts'],['queue','In progress'],['approved','Approved']];
 let DATA={inbox:[],drafts:[],approved:[]};
-function renderTabs(){const n=DATA.drafts.filter(d=>d.data.status==='pending_review').length+DATA.drafts.filter(d=>d.data.status==='rejected_phi_tripwire').length;
+function renderTabs(){const n=DATA.drafts.filter(d=>d.data.status==='pending_review'||d.data.status==='rejected_phi_tripwire'||d.data.status==='rejected_input').length;
   const nav=$('tabs');nav.replaceChildren(...TABS.map(([id,label])=>el('button',{role:'tab','aria-selected':S.tab===id,onclick:()=>{S.tab=id;render(true)}},label,id==='review'&&n?el('span',{class:'badge'},n):null,id==='queue'&&DATA.inbox.length?el('span',{class:'badge'},DATA.inbox.length):null)))}
 function roleSelect(id,withAll){const s=el('select',{id});if(withAll)s.append(el('option',{value:''},'All roles'));
   for(const[rid,a]of Object.entries(S.agents).sort())s.append(el('option',{value:rid},rid+' – '+a.role_title));return s}
@@ -159,6 +161,7 @@ function newForm(){
 async function submit(){
   const who=$('who').value.trim();if(!who){banner('Please enter your name at the top first.','bad');return}
   const rid=$('f-role').value,ins=$('f-ins').value.trim();
+  if(statusInfo().held){banner('AI runner is paused. Please tell the office manager.','bad');return}
   if(isPaused(rid)){banner(rid+' is paused by an administrator. Choose another seat or try later.','bad');return}
   if(!ins){banner('Please write your request.','bad');return}
   const hits=phiScan(ins+' '+who+' '+$('f-tone').value);if(hits.length){banner('Blocked: possible identifiers ('+hits.join(', ')+').','bad');return}
@@ -170,7 +173,7 @@ async function submit(){
 function reviewList(){const items=DATA.drafts.filter(matches);if(!items.length)return el('div',{class:'empty'},'No drafts waiting.');
   return el('div',{},items.map(({name,data:d,rid})=>{
     const base=name.replace(/\.json$/,'');
-    if(d.status==='rejected_phi_tripwire')return el('div',{class:'card'},el('strong',{},rid+' – '+(d.requester||'')),el('div',{class:'msg bad',style:'margin-top:8px'},d.rejection_note||'Blocked by the privacy check.'),
+    if(d.status==='rejected_phi_tripwire'||d.status==='rejected_input')return el('div',{class:'card'},el('strong',{},rid+' – '+(d.requester||'')),el('div',{class:'msg bad',style:'margin-top:8px'},d.rejection_note||'Not processed.'),
       el('div',{class:'actions'},el('button',{onclick:async()=>{await(await sub(rid,'drafts')).removeEntry(name);await refresh()}},'Dismiss')));
     const ta=el('textarea',{style:'min-height:200px'});ta.value=d.draft||'';
     const fb=el('input',{placeholder:'What should change? (required to request a revision)'});
@@ -217,7 +220,7 @@ async function pick(){
   await refresh();render(true);clearInterval(S.timer);S.timer=setInterval(refresh,5000)}
 if(!window.showDirectoryPicker){$('unsupported').classList.remove('hidden');$('pick').disabled=true}
 $('pick').addEventListener('click',pick);
-window.__ws={pick,refresh,S,discardDraft,applyPausedToForm,statusInfo,newForm,renderNotices,loadStatus}; // for testing only; exposes nothing outside this page
+window.__ws={pick,refresh,S,discardDraft,applyPausedToForm,statusInfo,newForm,renderNotices,loadStatus,submit}; // for testing only; exposes nothing outside this page
 })();
 </script>
 </body>

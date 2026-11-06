@@ -46,11 +46,65 @@ class ConfigLocationError(ConfigError):
     """The settings folder is inside the shared workspace."""
 
 
+class ConfigMissingError(ConfigError):
+    """The settings folder exists, but config.json does not."""
+
+
+class LayoutError(ConfigError):
+    """The program folder and the shared workspace overlap."""
+
+
+LAST_GOOD_NOTE = "using last good settings"
+
+# Tests only: pretend the program lives somewhere else. None means "this file's folder".
+_app_dir_override = None
+
+
 # --------------------------------------------------------------------------- location
 def set_config_dir(path):
     """Tests only: use another settings folder. Pass None to go back to ~/.office-ai."""
     global _dir_override
     _dir_override = Path(path) if path else None
+
+
+def set_app_dir(path):
+    """Tests only: treat another folder as the program folder. Pass None to reset."""
+    global _app_dir_override
+    _app_dir_override = str(Path(path).resolve()) if path else None
+
+
+def app_dir():
+    """Folder that holds runner.py, admin.py, and config.py (symlinks resolved)."""
+    if _app_dir_override:
+        return _app_dir_override
+    return str(Path(__file__).resolve().parent)
+
+
+def same_or_nested(a, b):
+    """True if the two resolved paths are the same or one is inside the other."""
+    a = os.path.normcase(os.path.abspath(str(a)))
+    b = os.path.normcase(os.path.abspath(str(b)))
+    try:
+        common = os.path.normcase(os.path.commonpath([a, b]))
+    except ValueError:
+        return False
+    return common == a or common == b
+
+
+def assert_separated(root):
+    """Refuse to run when the program folder and the workspace overlap.
+
+    Both paths are resolved (symlinks followed) before the comparison.
+    """
+    app = str(Path(app_dir()).resolve())
+    ws = str(Path(root).resolve())
+    if same_or_nested(app, ws):
+        raise LayoutError(
+            "The program folder and the shared workspace are the same folder, or one is inside the other, "
+            "so this program will not start. Keep runner.py, admin.py, config.py, and the launchers in a "
+            "folder that staff cannot change, and keep that folder outside the shared workspace. The shared "
+            "workspace must not be inside the program folder either. "
+            "Program folder: %s. Shared workspace: %s." % (app, ws))
 
 
 def config_dir():
@@ -86,6 +140,7 @@ def default_config():
         "admin_port": DEFAULT_PORT,
         "session_timeout_minutes": DEFAULT_SESSION_MINUTES,
         "recent_models": [],
+        "dashboard_path": None,
     }
 
 
@@ -141,6 +196,11 @@ def normalize(raw):
     rm = raw.get("recent_models")
     if isinstance(rm, list):
         cfg["recent_models"] = [m for m in rm if valid_model(m)][:10]
+    dp = raw.get("dashboard_path")
+    if isinstance(dp, str):
+        dp = dp.strip()
+        if dp and len(dp) <= 500 and "\n" not in dp and "\r" not in dp:
+            cfg["dashboard_path"] = dp
     return cfg
 
 
@@ -153,6 +213,10 @@ def load(root=None):
     check_location(root)
     p = config_path()
     if not p.exists():
+        if config_dir().exists():
+            raise ConfigMissingError(
+                "The settings folder exists but config.json is missing. The runner will not process any "
+                "tasks until that file is restored. Waiting requests stay in the inbox.")
         return default_config()
     try:
         with open(p, "r", encoding="utf-8") as f:
@@ -160,6 +224,8 @@ def load(root=None):
     except (OSError, ValueError):
         raise ConfigError("The settings file (%s) could not be read. It may be damaged; "
                           "restore a copy or delete it and set things up again." % p) from None
+    if not isinstance(raw, dict):
+        raise ConfigError("The settings file (%s) is not valid. It should be a JSON object with the saved settings." % p)
     return normalize(raw)
 
 
@@ -234,15 +300,31 @@ def _restrict_windows(path, is_dir=False):
     return ok
 
 
+def lock_down_file(path):
+    """Best-effort: make one settings file readable only by the current user."""
+    if not os.path.exists(path):
+        return
+    if os.name == "nt":
+        _restrict_windows(path)
+    else:
+        try:
+            os.chmod(str(path), 0o600)
+        except OSError:
+            pass
+
+
 def ensure_private():
     """(Re)apply private permissions to the settings folder and file. Safe to call often."""
     d, p = config_dir(), config_path()
     if not d.exists():
         return
+    manifest = d / "manifest.json"
     if os.name == "nt":
         ok = True
         if p.exists():
             ok = _restrict_windows(p)
+        if ok and manifest.exists():
+            ok = _restrict_windows(manifest)
         if ok:
             _restrict_windows(d, is_dir=True)
     else:
@@ -250,8 +332,35 @@ def ensure_private():
             os.chmod(str(d), 0o700)
             if p.exists():
                 os.chmod(str(p), 0o600)
+            if manifest.exists():
+                os.chmod(str(manifest), 0o600)
         except OSError:
             pass
+
+
+def evaluate_settings(root):
+    """Classify settings for one check. Does not use an in-memory last-good copy.
+
+    Returns state (first_run, ready, or locked), cfg, a detail string for the owner,
+    recoverable (True only when a damaged config.json may fall back to last-good), and code.
+    A settings folder inside the workspace is locked and the file is not read.
+    """
+    if not config_dir().exists():
+        return {"state": "first_run", "cfg": default_config(), "detail": None,
+                "recoverable": False, "code": "first_run"}
+    try:
+        check_location(root)
+    except ConfigLocationError as e:
+        return {"state": "locked", "cfg": None, "detail": str(e), "recoverable": False, "code": "location"}
+    if not config_path().exists():
+        return {"state": "locked", "cfg": None, "recoverable": False, "code": "missing",
+                "detail": "The settings folder exists but config.json is missing. The runner will not process "
+                          "any tasks until that file is restored. Waiting requests stay in the inbox."}
+    try:
+        cfg = load(root)
+    except ConfigError as e:
+        return {"state": "locked", "cfg": None, "detail": str(e), "recoverable": True, "code": "invalid"}
+    return {"state": "ready", "cfg": cfg, "detail": None, "recoverable": False, "code": "ok"}
 
 
 def permission_report():

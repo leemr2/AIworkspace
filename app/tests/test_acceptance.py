@@ -22,7 +22,10 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-PROJECT = Path(__file__).resolve().parent.parent
+PROJECT = Path(__file__).resolve().parent.parent          # the program folder (app/)
+REPO = PROJECT.parent
+TEMPLATE = REPO / "workspace-template"
+DASHBOARD = REPO / "dashboard" / "dashboard.html"
 sys.path.insert(0, str(PROJECT))
 import admin      # noqa: E402
 import config     # noqa: E402
@@ -50,7 +53,7 @@ class Base(unittest.TestCase):
         self.ws = os.path.join(self.tmp, "workspace")
         self.cfgdir = os.path.join(self.tmp, "home", ".office-ai")      # NOT inside the workspace
         os.makedirs(self.ws)
-        shutil.copytree(PROJECT / "_agents", os.path.join(self.ws, "_agents"),
+        shutil.copytree(TEMPLATE / "_agents", os.path.join(self.ws, "_agents"),
                         ignore=shutil.ignore_patterns("_public_status.json"))
         self.agents = runner.load_agents(self.ws)
         for a in self.agents.values():
@@ -76,6 +79,7 @@ class Base(unittest.TestCase):
             if v is not None:
                 os.environ[k] = v
         config.set_config_dir(None)
+        config.set_app_dir(None)
         printed = self.out.getvalue()
         _rmtree(self.tmp)
         for secret in (FAKE_KEY, ENV_KEY):
@@ -318,7 +322,7 @@ class T2_ConfigLocation(Base):
         with self.assertRaises(config.ConfigLocationError):
             config.check_location(self.tmp)       # tmp contains tmp/home/.office-ai
 
-    def test_runner_ignores_a_config_inside_the_workspace(self):
+    def test_runner_locks_when_config_is_inside_the_workspace(self):
         bad = Path(self.ws) / ".office-ai"
         bad.mkdir()
         (bad / "config.json").write_text(json.dumps({"provider": "anthropic", "api_key": FAKE_KEY}))
@@ -327,8 +331,13 @@ class T2_ConfigLocation(Base):
         self.add_task("R033", "t-1")
         self.sweep()
         self.assertEqual(calls, [], "key from an unsafe settings folder must not be used")
-        self.assertTrue(self.log_events("config_error"))
-        self.assertEqual(len(self.names("R033", "drafts")), 1)       # fell back to the stub
+        self.assertEqual(self.names("R033", "inbox"), ["t-1.json"])
+        self.assertEqual(self.names("R033", "drafts"), [])
+        self.assertEqual(self.status()["runner_state"], "locked")
+        self.assertEqual(self.status()["message"], runner.STAFF_HOLD_MESSAGE)
+        self.assertNotIn(self.ws, self.status()["message"])
+        self.assertTrue(self.log_events("runner_locked"))
+        self.assertNotIn(FAKE_KEY, json.dumps(self.status()))
 
 
 class T3_RequestGuards(Base):
@@ -770,7 +779,7 @@ class T8_ExistingFlow(Base):
 
 class T9_Dashboard(Base):
     def test_static_properties(self):
-        html = (PROJECT / "dashboard.html").read_text(encoding="utf-8")
+        html = DASHBOARD.read_text(encoding="utf-8")
         csp = html.split('http-equiv="Content-Security-Policy" content="')[1].split('"')[0]
         self.assertNotIn("connect-src", csp)
         self.assertIn("default-src 'none'", csp)
@@ -793,8 +802,8 @@ class T9_Dashboard(Base):
 
     @unittest.skipUnless(shutil.which("node"), "Node.js not installed: dashboard behaviour test skipped")
     def test_paused_seat_disabled_and_discard_marker(self):
-        r = subprocess.run(["node", str(PROJECT / "tests" / "dashboard_harness.js"), str(PROJECT / "dashboard.html"),
-                            str(PROJECT / "_agents")], capture_output=True, text=True, timeout=60)
+        r = subprocess.run(["node", str(PROJECT / "tests" / "dashboard_harness.js"), str(DASHBOARD),
+                            str(TEMPLATE / "_agents")], capture_output=True, text=True, timeout=60)
         self.assertEqual(r.returncode, 0, r.stderr)
         rep = json.loads(r.stdout)
         opt = {o["value"]: o for o in rep["paused"]["options"]}
@@ -820,6 +829,11 @@ class T9_Dashboard(Base):
         self.assertEqual(rep["ops"][0].split(":")[0], "write")            # marker is written BEFORE the draft is removed
         self.assertEqual(rep["ops"][1].split(":")[0], "remove")
         self.assertEqual(rep["cancel"], {"archive": [], "drafts": ["t-x.json"]})   # cancelled dialog changes nothing
+        self.assertIn("Please tell the office manager", rep["locked"]["notices"])
+        self.assertTrue(rep["locked"]["sendDisabled"])
+        self.assertIn("Please tell the office manager", rep["reviewHold"]["notices"])
+        self.assertTrue(rep["reviewHold"]["sendDisabled"])
+        self.assertNotIn("Please tell the office manager", rep["paused"]["notices"])
 
     def test_discard_marker_is_counted_by_usage(self):
         with open(os.path.join(self.folder("R034", "archive"), "t-z.discarded.json"), "w") as f:
@@ -837,6 +851,332 @@ class T10_Launchers(Base):
             first = [l for l in text.splitlines() if "WORKSPACE" in l][0]
             self.assertIn("WORKSPACE=", first, name)
             self.assertLess(text.index("WORKSPACE="), text.index("runner.py" if "runner" in name else "admin.py"), name)
+            self.assertIn("outside the shared folder", text, name)
+
+
+class T11_Hardening(Base):
+    def test_root_is_required(self):
+        with self.assertRaises(SystemExit) as cm:
+            runner.main([])
+        self.assertEqual(cm.exception.code, 2)
+        with self.assertRaises(SystemExit) as cm:
+            admin.main([])
+        self.assertEqual(cm.exception.code, 2)
+
+    def test_refuses_when_program_folder_is_inside_workspace(self):
+        app = os.path.join(self.ws, "program")
+        os.makedirs(app)
+        config.set_app_dir(app)
+        self.add_task("R033", "t-1")
+        self.assertEqual(runner.main(["--root", self.ws, "--once"]), 2)
+        self.assertIn("will not start", self.out.getvalue())
+        self.assertEqual(self.names("R033", "inbox"), ["t-1.json"])
+        self.assertEqual(self.names("R033", "drafts"), [])
+        with mock.patch.object(admin, "make_server", side_effect=AssertionError("server must not start")):
+            self.assertEqual(admin.main(["--root", self.ws, "--port", "0"]), 2)
+
+    def test_refuses_when_workspace_is_inside_program_folder(self):
+        config.set_app_dir(self.tmp)
+        self.add_task("R033", "t-1")
+        self.assertEqual(runner.main(["--root", self.ws, "--once"]), 2)
+        self.assertEqual(self.names("R033", "inbox"), ["t-1.json"])
+        self.assertFalse(self.names("R033", "drafts"))
+        with mock.patch.object(admin, "make_server", side_effect=AssertionError("server must not start")):
+            self.assertEqual(admin.main(["--root", self.ws, "--port", "0"]), 2)
+
+    def test_resolved_symlink_is_not_a_false_overlap(self):
+        program = os.path.join(self.tmp, "program")
+        os.makedirs(program)
+        link = os.path.join(program, "workspace-link")
+        try:
+            kwargs = {"target_is_directory": True} if os.name == "nt" else {}
+            os.symlink(self.ws, link, **kwargs)
+        except (OSError, NotImplementedError, TypeError) as e:
+            self.skipTest("symlink creation is not permitted on this platform: %s" % e)
+        config.set_app_dir(program)
+        self.assertEqual(runner.main(["--root", link, "--once"]), 0, self.out.getvalue())
+
+    def test_first_run_stub_works_and_real_backend_is_refused(self):
+        self.assertFalse(os.path.isdir(self.cfgdir))
+        self.add_task("R033", "t-stub")
+        self.assertEqual(self.sweep(), 1)
+        self.assertEqual(self.names("R033", "drafts"), ["t-stub.json"])
+        st = self.status()
+        self.assertEqual(st["runner_state"], "first_run")
+        self.assertEqual(st["message"], "")
+        self.assertFalse(os.path.isdir(self.cfgdir))
+        self.add_task("R034", "t-real")
+        calls = self.mock_anthropic()
+        self.assertEqual(self.sweep("anthropic"), 0)
+        self.assertEqual(calls, [])
+        self.assertEqual(self.names("R034", "inbox"), ["t-real.json"])
+        self.assertIn("REFUSED", self.out.getvalue())
+        self.assertEqual(self.status()["runner_state"], "first_run")
+
+    def test_missing_config_locks_and_recovers(self):
+        os.makedirs(self.cfgdir)
+        self.add_task("R033", "t-1")
+        self.sweep()
+        self.assertEqual(self.status()["runner_state"], "locked")
+        self.assertIn("office manager", self.status()["message"])
+        self.assertEqual(self.names("R033", "inbox"), ["t-1.json"])
+        self.assertEqual(self.names("R033", "drafts"), [])
+        config.save(config.default_config(), self.ws)
+        self.sweep()
+        self.assertEqual(self.names("R033", "drafts"), ["t-1.json"])
+        self.assertEqual(self.status()["runner_state"], "ready")
+
+    def test_invalid_config_without_last_good_locks_and_recovers(self):
+        os.makedirs(self.cfgdir)
+        config.config_path().write_text("{", encoding="utf-8")
+        self.add_task("R033", "t-1")
+        self.sweep()
+        self.assertEqual(self.status()["runner_state"], "locked")
+        self.assertEqual(self.names("R033", "inbox"), ["t-1.json"])
+        config.save(config.default_config(), self.ws)
+        self.sweep()
+        self.assertEqual(self.status()["runner_state"], "ready")
+        self.assertEqual(self.names("R033", "drafts"), ["t-1.json"])
+
+    def test_corrupt_config_keeps_last_good_settings(self):
+        self.save_cfg(provider="stub")
+        self.add_task("R033", "t-1")
+        self.sweep()
+        config.config_path().write_text("{", encoding="utf-8")
+        self.add_task("R033", "t-2")
+        self.sweep()
+        st = self.status()
+        self.assertEqual(st["runner_state"], "ready")
+        self.assertEqual(st.get("settings_note"), "using last good settings")
+        self.assertEqual(sorted(self.names("R033", "drafts")), ["t-1.json", "t-2.json"])
+        self.assertIn("using last good settings", self.out.getvalue())
+
+    def test_admin_starts_when_config_is_invalid_and_shows_last_good(self):
+        os.makedirs(self.cfgdir)
+        config.config_path().write_text("{", encoding="utf-8")
+        fake = mock.Mock()
+        fake.serve_forever = lambda: None
+        fake.server_close = lambda: None
+        fake.app = mock.Mock(port=9)
+        with mock.patch.object(admin, "make_server", return_value=fake) as made:
+            self.assertEqual(admin.main(["--root", self.ws, "--port", "9"]), 0)
+        made.assert_called_once()
+        self.assertIn("will still start", self.out.getvalue())
+        config.save(config.default_config(), self.ws)
+        srv, c = self.logged_in()
+        self.assertEqual(c.get("/api/state")[0], 200)
+        config.config_path().write_text("{", encoding="utf-8")
+        status, data, _ = c.get("/api/state")
+        self.assertEqual(status, 200, data)
+        self.assertEqual(data["hold"]["settings_note"], "using last good settings")
+        self.assertIn("settings_note", admin.PAGE)
+
+    def _baseline(self):
+        self.save_cfg()
+        self.sweep()
+
+    def test_one_agent_file_pauses_only_that_seat(self):
+        self._baseline()
+        path = os.path.join(self.ws, "_agents", "R033.json")
+        text = Path(path).read_text(encoding="utf-8")
+        self.assertIn("Digital Marketing", text)
+        Path(path).write_text(text.replace("Digital Marketing", "Digital MarketingX"), encoding="utf-8")
+        self.add_task("R033", "t-a")
+        self.add_task("R034", "t-b")
+        self.sweep()
+        self.assertEqual(self.names("R033", "inbox"), ["t-a.json"])
+        self.assertEqual(self.names("R033", "drafts"), [])
+        self.assertEqual(self.names("R034", "drafts"), ["t-b.json"])
+        st = self.status()
+        self.assertEqual(st["runner_state"], "paused_for_review")
+        self.assertEqual(st["message"], runner.STAFF_HOLD_MESSAGE)
+        self.assertFalse(st["seats"]["R033"]["enabled"])
+        self.assertTrue(st["seats"]["R034"]["enabled"])
+        self.assertNotIn(self.ws, json.dumps(st))
+
+    def test_decision_rights_change_pauses_every_seat(self):
+        self._baseline()
+        path = os.path.join(self.ws, "_agents", "_decision_rights.json")
+        with open(path, "a", encoding="utf-8") as f:
+            f.write("\n")
+        self.add_task("R033", "t-a")
+        self.add_task("R034", "t-b")
+        self.sweep()
+        self.assertEqual(self.names("R033", "inbox"), ["t-a.json"])
+        self.assertEqual(self.names("R034", "inbox"), ["t-b.json"])
+        self.assertEqual(self.status()["runner_state"], "paused_for_review")
+        self.assertTrue(all(not seat["enabled"] for seat in self.status()["seats"].values()))
+
+    def test_approve_needs_a_session_and_then_seats_resume(self):
+        self._baseline()
+        path = os.path.join(self.ws, "_agents", "R033.json")
+        Path(path).write_text(Path(path).read_text(encoding="utf-8") + "\n", encoding="utf-8")
+        self.add_task("R033", "t-a")
+        self.sweep()
+        self.assertEqual(self.names("R033", "drafts"), [])
+        srv, c = self.logged_in()
+        self.assertEqual(self.client(srv).req("POST", "/api/manifest/approve", {})[0], 401)
+        self.assertEqual(c.req("POST", "/api/manifest/approve", {}, csrf=False)[0], 403)
+        status, data, _ = c.post("/api/manifest/approve", {})
+        self.assertEqual(status, 200, data)
+        self.assertEqual(data["hold"]["changes"], [])
+        self.sweep()
+        self.assertEqual(self.names("R033", "drafts"), ["t-a.json"])
+        self.assertEqual(self.status()["runner_state"], "ready")
+
+    def test_added_and_removed_sop_files_are_detected(self):
+        self._baseline()
+        sop = os.path.join(self.ws, "_sops", "R042", "extra.txt")
+        os.makedirs(os.path.dirname(sop))
+        with open(sop, "w", encoding="utf-8") as f:
+            f.write("Approved steps.\n")
+        self.add_task("R042", "t-s")
+        self.add_task("R033", "t-other")
+        self.sweep()
+        self.assertEqual(self.names("R042", "inbox"), ["t-s.json"])
+        self.assertEqual(self.names("R033", "drafts"), ["t-other.json"])
+        srv, c = self.logged_in()
+        status, state, _ = c.get("/api/state")
+        self.assertEqual(status, 200)
+        added = next(ch for ch in state["hold"]["changes"] if ch["name"].endswith("extra.txt"))
+        self.assertEqual(added["change"], "added")
+        self.assertIsNone(added["old_hash"])
+        self.assertTrue(added["new_hash"])
+        self.assertIsNotNone(added["size"])
+        self.assertEqual(c.post("/api/manifest/approve", {})[0], 200)
+        os.remove(sop)
+        self.sweep()
+        self.assertEqual(self.names("R042", "inbox"), ["t-s.json"])
+        removed = next(ch for ch in c.get("/api/state")[1]["hold"]["changes"] if ch["name"].endswith("extra.txt"))
+        self.assertEqual(removed["change"], "removed")
+        self.assertIsNone(removed["new_hash"])
+        self.assertTrue(removed["old_hash"])
+
+    def test_symlink_in_inbox_is_quarantined_without_touching_the_target(self):
+        target = os.path.join(self.tmp, "secret.txt")
+        with open(target, "w", encoding="utf-8") as f:
+            f.write("do-not-touch-target")
+        link = os.path.join(self.folder("R033", "inbox"), "t-link.json")
+        try:
+            os.symlink(target, link)
+        except (OSError, NotImplementedError, AttributeError) as e:
+            self.skipTest("symlink creation is not permitted on this platform: %s" % e)
+        self.sweep()
+        self.assertEqual(Path(target).read_text(encoding="utf-8"), "do-not-touch-target")
+        self.assertFalse(os.path.lexists(link))
+        events = self.log_events("input_quarantined")
+        self.assertTrue(events)
+        self.assertEqual(events[0]["kind"], "symlink")
+        blob = json.dumps(events)
+        self.assertNotIn("do-not-touch-target", blob)
+        self.assertNotIn("secret.txt", blob)
+
+    def test_oversize_and_task_id_mismatch_are_rejected(self):
+        big = self.add_task("R033", "t-big", "short")
+        with open(big, "wb") as f:
+            f.write(b"{" + b"X" * (64 * 1024))
+        os.utime(big, (1, 1))
+        self.add_task("R033", "t-long", "A" * 8001)
+        self.add_task("R033", "t-oklen", "B" * 8000)
+        self.add_task("R033", "t-file")
+        mismatch = os.path.join(self.folder("R033", "inbox"), "t-file.json")
+        with open(mismatch, encoding="utf-8") as f:
+            data = json.load(f)
+        data["task_id"] = "t-other"
+        with open(mismatch, "w", encoding="utf-8") as f:
+            json.dump(data, f)
+        os.utime(mismatch, (1, 1))
+        self.add_task("R034", "t-path", **{"folder": "..\\..\\outside"})
+        self.sweep()
+        self.assertFalse(os.path.exists(os.path.join(self.tmp, "outside")))
+        self.assertEqual(self.names("R033", "inbox"), [])
+        with open(os.path.join(self.folder("R033", "drafts"), "t-big.json"), encoding="utf-8") as f:
+            big_draft = json.load(f)
+        self.assertEqual(big_draft["status"], "rejected_input")
+        self.assertIn("64 KB", big_draft["rejection_note"])
+        self.assertNotIn("XXX", json.dumps(big_draft))
+        with open(os.path.join(self.folder("R033", "drafts"), "t-long.json"), encoding="utf-8") as f:
+            long_draft = json.load(f)
+        self.assertIn("8,000", long_draft["rejection_note"])
+        self.assertEqual(long_draft["instructions"], "[REMOVED]")
+        self.assertNotIn("AAA", json.dumps(long_draft))
+        self.assertIn("t-file.rejected.json", self.names("R033", "archive"))
+        self.assertNotIn("t-file.json", self.names("R033", "drafts"))
+        self.assertIn("t-oklen.json", self.names("R033", "drafts"))
+        self.assertEqual(self.names("R034", "drafts"), ["t-path.json"])
+        reasons = {e["reason"] for e in self.log_events("input_rejected")}
+        self.assertIn("too_large", reasons)
+        self.assertIn("instructions_too_long", reasons)
+
+    def test_public_status_has_state_and_no_secrets(self):
+        self.save_cfg(provider="anthropic", api_key=FAKE_KEY)
+        calls = self.mock_anthropic()
+        self.add_task("R033", "t-1", "Please draft a note about Monday hours.")
+        self.sweep()
+        self.assertTrue(calls)
+        st = self.status()
+        self.assertIn(st["runner_state"], ("ready", "first_run", "locked", "paused_for_review"))
+        self.assertIn("message", st)
+        blob = json.dumps(st)
+        for needle in (FAKE_KEY, PIN, self.tmp, "config.json", "Monday hours", "sk-"):
+            self.assertNotIn(needle, blob)
+
+    def test_safety_check_items_and_graceful_degrade(self):
+        self.save_cfg()
+        items = {i["id"]: i for i in admin.build_safety(self.ws)}
+        self.assertEqual(items["app_outside_workspace"]["status"], "pass")
+        self.assertEqual(items["app_outside_workspace"]["level"], "hard")
+        self.assertEqual(items["settings_outside_workspace"]["status"], "pass")
+        self.assertEqual(items["config_permissions"]["status"], "pass")
+        self.assertEqual(items["manual_staff_account"]["status"], "manual")
+        self.assertEqual(items["manual_staff_account"]["text"],
+                         "Log in as a staff account and confirm you cannot edit _agents or the app folder.")
+        self.assertEqual(items["perm_dashboard"]["status"], "unknown")
+        self.assertIn("could not verify", items["perm_dashboard"]["text"].lower())
+        config.set_app_dir(self.ws)
+        self.assertEqual({i["id"]: i for i in admin.build_safety(self.ws)}["app_outside_workspace"]["status"], "fail")
+        config.set_app_dir(None)
+        warned = admin.build_safety(self.ws, platform="nt", icacls=lambda path: "Everyone:(OI)(CI)(F)\n")
+        agents_item = next(i for i in warned if i["id"] == "perm_agents")
+        self.assertEqual(agents_item["status"], "warn")
+        self.assertEqual(agents_item["level"], "advisory")
+        self.assertIn("Everyone", agents_item["text"])
+        unknown = admin.build_safety(self.ws, platform="nt", icacls=lambda path: (_ for _ in ()).throw(OSError("no icacls")))
+        advisory = [i for i in unknown if i["id"] in ("perm_agents", "perm_sops", "perm_app")]
+        self.assertTrue(all(i["status"] == "unknown" for i in advisory))
+        self.assertTrue(all("could not verify" in i["text"].lower() for i in advisory))
+        broken = admin.build_safety(self.ws, platform="posix", stat_mode=lambda path: (_ for _ in ()).throw(OSError("no stat")))
+        self.assertEqual(next(i for i in broken if i["id"] == "perm_sops")["status"], "unknown")
+        open_mode = admin.build_safety(self.ws, platform="posix", stat_mode=lambda path: 0o100777)
+        self.assertEqual(next(i for i in open_mode if i["id"] == "perm_app")["status"], "warn")
+        srv, c = self.logged_in()
+        status, data, _ = c.get("/api/safety")
+        self.assertEqual(status, 200)
+        ids = {i["id"] for i in data["items"]}
+        for needed in ("app_outside_workspace", "settings_outside_workspace", "config_permissions",
+                       "perm_agents", "perm_sops", "perm_app", "perm_dashboard", "manual_staff_account"):
+            self.assertIn(needed, ids)
+        self.assertEqual(self.client(srv).req("GET", "/api/safety")[0], 401)
+        self.assertIn("Approve current version", admin.PAGE)
+        self.assertIn("Safety check", admin.PAGE)
+        self.assertIn("Could not verify", admin.PAGE)
+
+    def test_init_workspace_copies_the_template_only(self):
+        import importlib.util
+        spec = importlib.util.spec_from_file_location("init_workspace", str(PROJECT / "init-workspace.py"))
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        dest = os.path.join(self.tmp, "fresh-ws")
+        mod.create_workspace(dest)
+        self.assertEqual(len(list(Path(dest, "_agents").glob("R*.json"))), 7)
+        self.assertTrue(os.path.isfile(os.path.join(dest, "_agents", "_decision_rights.json")))
+        self.assertTrue(os.path.isfile(os.path.join(dest, "R033-digital-marketing", "inbox", ".keep")))
+        self.assertTrue(os.path.isfile(os.path.join(dest, "_sops", "R033", "PUT-APPROVED-SOP-TEXT-HERE.txt")))
+        self.assertFalse(os.path.exists(os.path.join(dest, "runner.py")))
+        self.assertFalse(os.path.exists(os.path.join(dest, "dashboard.html")))
+        with self.assertRaises(SystemExit):
+            mod.create_workspace(PROJECT / "nested-ws")
+        self.assertFalse((PROJECT / "nested-ws").exists())
 
 
 if __name__ == "__main__":
