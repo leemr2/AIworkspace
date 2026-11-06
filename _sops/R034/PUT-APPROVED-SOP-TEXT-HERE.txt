@@ -1,0 +1,8 @@
+Place plain-text (.txt or .md) copies of the approved SOPs for this role here.
+The agent reads them as reference. Only add documents the owner has validated.
+SOPs listed in the workbook for this role:
+- Zel Social Media posting instructions.  [Located SOP - owner validation pending]
+- Practice Concierge and Marketing Coordinator Bible  [Legacy embedded SOP bundle - review before use]
+- Kirsten Instructions for how to conduct our Marketing Plan  [Located SOP - owner validation pending]
+- IG connection Instructions  [Located SOP - owner validation pending]
+- AI Social Media Inbound Engagement Agent SOP  [Located SOP - owner validation pending]

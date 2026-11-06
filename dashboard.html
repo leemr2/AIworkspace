@@ -1,0 +1,224 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<!-- Privacy lockdown: this page cannot make ANY network request. No connect-src, no external scripts, fonts or images. -->
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; img-src data:; base-uri 'none'; form-action 'none'">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Office AI Workspace</title>
+<style>
+:root{--bg:#f6f7f9;--card:#fff;--ink:#1b2430;--mute:#5d6b7c;--line:#dde2e8;--acc:#1f5fbf;--accink:#fff;--warn:#9a5b00;--warnbg:#fff3dc;--bad:#a12626;--badbg:#fde8e8;--ok:#1d6b43;--okbg:#e4f4ea}
+@media (prefers-color-scheme:dark){:root{--bg:#14181e;--card:#1c222b;--ink:#e8ecf1;--mute:#9aa7b6;--line:#2f3844;--acc:#6aa3ff;--accink:#0c1624;--warn:#f0c070;--warnbg:#3a2d12;--bad:#ff9a9a;--badbg:#3b1d1d;--ok:#8fd9ae;--okbg:#17301f}}
+*{box-sizing:border-box}
+body{margin:0;font:15px/1.5 system-ui,-apple-system,"Segoe UI",sans-serif;background:var(--bg);color:var(--ink)}
+header{display:flex;flex-wrap:wrap;gap:12px;align-items:center;padding:14px 20px;background:var(--card);border-bottom:1px solid var(--line)}
+header h1{font-size:17px;margin:0;font-weight:650;flex:1 1 auto}
+.lock{font-size:12px;color:var(--ok);background:var(--okbg);padding:3px 9px;border-radius:99px}
+main{max-width:980px;margin:0 auto;padding:20px}
+button{font:inherit;cursor:pointer;border-radius:8px;border:1px solid var(--line);background:var(--card);color:var(--ink);padding:7px 14px}
+button.primary{background:var(--acc);color:var(--accink);border-color:var(--acc);font-weight:600}
+button.danger{color:var(--bad)}
+button:disabled{opacity:.5;cursor:not-allowed}
+input,select,textarea{font:inherit;color:var(--ink);background:var(--card);border:1px solid var(--line);border-radius:8px;padding:8px 10px;width:100%}
+textarea{min-height:140px;resize:vertical}
+label{display:block;font-size:13px;color:var(--mute);margin:12px 0 4px}
+nav{display:flex;gap:4px;border-bottom:1px solid var(--line);margin-bottom:16px;flex-wrap:wrap}
+nav button{border:none;border-bottom:3px solid transparent;border-radius:0;background:none;padding:10px 14px;color:var(--mute)}
+nav button[aria-selected=true]{color:var(--ink);border-bottom-color:var(--acc);font-weight:600}
+.badge{display:inline-block;min-width:20px;text-align:center;background:var(--acc);color:var(--accink);border-radius:99px;font-size:12px;padding:0 6px;margin-left:6px}
+.card{background:var(--card);border:1px solid var(--line);border-radius:12px;padding:16px;margin-bottom:14px}
+.row{display:flex;gap:12px;flex-wrap:wrap}.row>*{flex:1 1 200px}
+.meta{font-size:13px;color:var(--mute)}
+.chip{display:inline-block;font-size:12px;padding:2px 8px;border-radius:99px;margin:4px 6px 0 0}
+.chip.warn{background:var(--warnbg);color:var(--warn)}.chip.bad{background:var(--badbg);color:var(--bad)}
+.empty{color:var(--mute);text-align:center;padding:36px 0}
+.actions{display:flex;gap:8px;flex-wrap:wrap;margin-top:10px}
+.msg{padding:10px 14px;border-radius:8px;margin:0 0 14px}.msg.bad{background:var(--badbg);color:var(--bad)}.msg.ok{background:var(--okbg);color:var(--ok)}.msg.warn{background:var(--warnbg);color:var(--warn)}
+.hint{font-size:13px;color:var(--mute);margin-top:6px}
+.hidden{display:none}
+</style>
+</head>
+<body>
+<header>
+  <h1>Office AI Workspace</h1>
+  <span class="lock" title="Content-Security-Policy blocks all network access from this page">No network access</span>
+  <input id="who" placeholder="Your name" style="width:170px" aria-label="Your name">
+  <button id="pick" class="primary">Choose workspace folder</button>
+</header>
+<main>
+  <div id="unsupported" class="msg bad hidden">This browser cannot open folders from a local page. Please open this file in Chrome or Edge.</div>
+  <div id="banner"></div>
+  <div id="notices"></div>
+  <div id="welcome" class="card">
+    <strong>How this works</strong>
+    <p class="meta">Pick the shared <em>AI-Workspace</em> folder. Requests you write here are saved as small files in a role's inbox. The AI runner on the office machine turns them into <b>drafts</b>. Nothing is sent or published until a person approves it here. Never type patient names, birthdates, phone numbers, or record numbers.</p>
+  </div>
+  <div id="app" class="hidden">
+    <nav id="tabs" role="tablist"></nav>
+    <div id="view"></div>
+  </div>
+</main>
+<script>
+(function(){
+'use strict';
+const BLOCK=[["SSN-like number",/\b\d{3}-\d{2}-\d{4}\b/],
+["phone number",/(?<!\d)(?:\+?1[\s.-]?)?\(?\d{3}\)?[\s.-]\d{3}[\s.-]\d{4}(?!\d)/],
+["date of birth",/\b(?:dob|d\.o\.b|date of birth|birthdate|born on)\b/i],
+["medical record / member id",/\b(?:mrn|medical record(?: number| no)?|member id|subscriber id|policy (?:number|no)|insurance id)\b/i],
+["full date (possible DOB/visit)",/\b(?:0?[1-9]|1[0-2])[\/-](?:0?[1-9]|[12]\d|3[01])[\/-](?:19|20)\d{2}\b/],
+["patient label",/\bpatient(?: name)?\s*[:=]\s*\S/i]];
+const phiScan=t=>BLOCK.filter(([n,r])=>r.test(t||'')).map(x=>x[0]);
+
+const S={root:null,agents:{},tab:'new',roleFilter:'',timer:null,busy:false,status:null};
+const STALE_MS=10*60*1000;
+const $=id=>document.getElementById(id);
+function el(tag,attrs,...kids){const e=document.createElement(tag);
+  for(const[k,v]of Object.entries(attrs||{})){if(k==='class')e.className=v;else if(k.startsWith('on'))e.addEventListener(k.slice(2),v);else if(v!==false&&v!=null)e.setAttribute(k,v===true?'':v)}
+  for(const c of kids.flat()){if(c==null)continue;e.append(c.nodeType?c:document.createTextNode(String(c)))}return e}
+function banner(text,kind){const b=$('banner');b.replaceChildren();if(text)b.append(el('div',{class:'msg '+(kind||'ok')},text));if(text)setTimeout(()=>{if(b.textContent===text)b.replaceChildren()},6000)}
+
+// ---- file helpers ----
+async function dir(parent,name,create){try{return await parent.getDirectoryHandle(name,{create:!!create})}catch(e){return null}}
+async function readJSON(d,name){const f=await(await d.getFileHandle(name)).getFile();return JSON.parse(await f.text())}
+async function writeJSON(d,name,obj){const fh=await d.getFileHandle(name,{create:true});const w=await fh.createWritable();await w.write(JSON.stringify(obj,null,1));await w.close()}
+async function listJSON(d){const out=[];if(!d)return out;for await(const e of d.values()){if(e.kind==='file'&&e.name.endsWith('.json')&&!e.name.startsWith('.')){try{out.push({name:e.name,data:await readJSON(d,e.name)})}catch(_){}}}
+  return out.sort((a,b)=>String(b.data.created||b.data.created_draft||'').localeCompare(String(a.data.created||a.data.created_draft||'')))}
+async function roleDir(rid){return dir(S.root,S.agents[rid].folder,true)}
+async function sub(rid,name){return dir(await roleDir(rid),name,true)}
+
+// ---- runner status (written by the runner; read-only here -- staff cannot un-pause a seat from this page) ----
+async function loadStatus(){
+  try{const ad=await dir(S.root,'_agents');S.status=ad?await readJSON(ad,'_public_status.json'):null}catch(_){S.status=null}
+  if(!S.status||typeof S.status!=='object'||typeof S.status.seats!=='object'||!S.status.seats)S.status=null}
+function statusInfo(now){
+  const st=S.status;if(!st)return{paused:[],stale:false};
+  const t=Date.parse(st.updated);
+  const stale=isNaN(t)||((now||Date.now())-t)>STALE_MS;
+  const paused=Object.keys(st.seats).filter(rid=>S.agents[rid]&&st.seats[rid]&&st.seats[rid].enabled===false).sort();
+  return{paused,stale}}
+function isPaused(rid){return statusInfo().paused.includes(rid)}
+function renderNotices(){
+  const n=$('notices');const info=statusInfo();const kids=[];
+  if(info.stale)kids.push(el('div',{class:'msg warn'},'The AI runner may be offline. Requests will wait in the queue until it is back.'));
+  if(info.paused.length)kids.push(el('div',{class:'msg warn'},'Paused by an administrator: '+info.paused.map(r=>r+' – '+S.agents[r].role_title).join('; ')+'. You cannot send new requests to a paused seat.'));
+  n.replaceChildren(...kids)}
+function applyPausedToForm(){
+  const sel=$('f-role');if(!sel)return;const paused=statusInfo().paused;
+  for(const o of Array.from(sel.options)){const p=paused.includes(o.value);const a=S.agents[o.value];
+    o.disabled=p;o.textContent=o.value+' – '+(a?a.role_title:'')+(p?' (paused)':'')}
+  const cur=Array.from(sel.options).find(o=>o.value===sel.value);
+  if(!cur||cur.disabled){const ok=Array.from(sel.options).find(o=>!o.disabled);if(ok){sel.value=ok.value;sel.dispatchEvent(new Event('change'))}}
+  const send=$('f-send');
+  if(send){const allPaused=!Array.from(sel.options).some(o=>!o.disabled);send.disabled=allPaused||phiScan(($('f-ins')||{}).value).length>0}}
+
+async function loadAgents(){
+  const ad=await dir(S.root,'_agents');if(!ad)throw new Error('This folder has no _agents folder. Choose the AI-Workspace folder.');
+  S.agents={};for await(const e of ad.values()){if(e.kind==='file'&&/^R\d{3}\.json$/.test(e.name)){try{const a=await readJSON(ad,e.name);S.agents[a.role_id]=a}catch(_){}}}
+  if(!Object.keys(S.agents).length)throw new Error('No agent seats found in _agents.');
+}
+async function gather(){
+  const g={inbox:[],drafts:[],approved:[]};
+  for(const rid of Object.keys(S.agents)){for(const k of Object.keys(g)){for(const it of await listJSON(await sub(rid,k)))g[k].push({...it,rid})}}
+  return g;
+}
+
+// ---- UI ----
+const TABS=[['new','New request'],['review','Review drafts'],['queue','In progress'],['approved','Approved']];
+let DATA={inbox:[],drafts:[],approved:[]};
+function renderTabs(){const n=DATA.drafts.filter(d=>d.data.status==='pending_review').length+DATA.drafts.filter(d=>d.data.status==='rejected_phi_tripwire').length;
+  const nav=$('tabs');nav.replaceChildren(...TABS.map(([id,label])=>el('button',{role:'tab','aria-selected':S.tab===id,onclick:()=>{S.tab=id;render(true)}},label,id==='review'&&n?el('span',{class:'badge'},n):null,id==='queue'&&DATA.inbox.length?el('span',{class:'badge'},DATA.inbox.length):null)))}
+function roleSelect(id,withAll){const s=el('select',{id});if(withAll)s.append(el('option',{value:''},'All roles'));
+  for(const[rid,a]of Object.entries(S.agents).sort())s.append(el('option',{value:rid},rid+' – '+a.role_title));return s}
+function render(force){renderTabs();const v=$('view');
+  if(S.tab==='new'){if(force||!v.querySelector('#f-role'))v.replaceChildren(newForm());return}
+  const keep=document.activeElement&&document.activeElement.tagName==='TEXTAREA'&&v.contains(document.activeElement);
+  if(keep&&!force)return; // don't clobber someone mid-edit
+  const filter=roleSelect('flt',true);filter.value=S.roleFilter;filter.addEventListener('change',()=>{S.roleFilter=filter.value;render(true)});
+  const head=el('div',{class:'row',style:'margin-bottom:12px;align-items:end'},el('div',{},el('label',{for:'flt',style:'margin-top:0'},'Role'),filter));
+  let body;
+  if(S.tab==='review')body=reviewList();else if(S.tab==='queue')body=queueList();else body=approvedList();
+  v.replaceChildren(head,body)}
+function matches(x){return !S.roleFilter||x.rid===S.roleFilter}
+
+function newForm(){
+  const role=roleSelect('f-role');const type=el('select',{id:'f-type'});
+  const fill=()=>{type.replaceChildren(...S.agents[role.value].authored_for_prototype.task_types.map(t=>el('option',{value:t.id},t.label)));upd()};
+  const info=el('div',{class:'hint',id:'f-info'});
+  const upd=()=>{const a=S.agents[role.value];const t=a.authored_for_prototype.task_types.find(x=>x.id===type.value);
+    const pend=a.from_workbook.sops.filter(s=>/pending|review before/i.test(s.status)).length;
+    info.textContent=(t?t.prompt+' ':'')+(pend?`(${pend} SOP(s) on record for this role are still awaiting owner validation.)`:'')};
+  role.addEventListener('change',fill);type.addEventListener('change',upd);
+  const ins=el('textarea',{id:'f-ins',placeholder:'What do you need? Include any facts the draft must use (hours, offers, dates). No patient information.'});
+  const warn=el('div',{id:'f-warn'});
+  const due=el('input',{id:'f-due',type:'date'});const tone=el('input',{id:'f-tone',placeholder:'e.g. warm, professional'});
+  const btn=el('button',{class:'primary',id:'f-send',onclick:submit},'Send to AI seat');
+  ins.addEventListener('input',()=>{const h=phiScan(ins.value);warn.replaceChildren(...(h.length?[el('div',{class:'msg bad'},'This looks like it contains personal identifiers ('+h.join(', ')+'). Remove them before sending.')]:[]));applyPausedToForm()});
+  const wrap=el('div',{class:'card'},el('label',{for:'f-role',style:'margin-top:0'},'Which AI seat?'),role,el('label',{for:'f-type'},'Type of task'),type,info,
+    el('label',{for:'f-ins'},'Request'),ins,warn,el('div',{class:'row'},el('div',{},el('label',{for:'f-due'},'Needed by (optional)'),due),el('div',{},el('label',{for:'f-tone'},'Tone (optional)'),tone)),el('div',{class:'actions'},btn));
+  wrap.querySelector('#f-role').id='f-role';fill();queueMicrotask(applyPausedToForm);return wrap}
+async function submit(){
+  const who=$('who').value.trim();if(!who){banner('Please enter your name at the top first.','bad');return}
+  const rid=$('f-role').value,ins=$('f-ins').value.trim();
+  if(isPaused(rid)){banner(rid+' is paused by an administrator. Choose another seat or try later.','bad');return}
+  if(!ins){banner('Please write your request.','bad');return}
+  const hits=phiScan(ins+' '+who+' '+$('f-tone').value);if(hits.length){banner('Blocked: possible identifiers ('+hits.join(', ')+').','bad');return}
+  const d=new Date(),p=n=>String(n).padStart(2,'0');
+  const id=`t-${d.getFullYear()}${p(d.getMonth()+1)}${p(d.getDate())}-${p(d.getHours())}${p(d.getMinutes())}${p(d.getSeconds())}-${Math.random().toString(36).slice(2,5)}`;
+  await writeJSON(await sub(rid,'inbox'),id+'.json',{task_id:id,role_id:rid,task_type:$('f-type').value,requester:who,created:d.toISOString(),due:$('f-due').value,tone:$('f-tone').value,instructions:ins,status:'queued'});
+  $('f-ins').value='';$('f-warn').replaceChildren();banner('Sent to '+rid+'. The draft will appear under "Review drafts" when the AI runner picks it up.');await refresh()}
+
+function reviewList(){const items=DATA.drafts.filter(matches);if(!items.length)return el('div',{class:'empty'},'No drafts waiting.');
+  return el('div',{},items.map(({name,data:d,rid})=>{
+    const base=name.replace(/\.json$/,'');
+    if(d.status==='rejected_phi_tripwire')return el('div',{class:'card'},el('strong',{},rid+' – '+(d.requester||'')),el('div',{class:'msg bad',style:'margin-top:8px'},d.rejection_note||'Blocked by the privacy check.'),
+      el('div',{class:'actions'},el('button',{onclick:async()=>{await(await sub(rid,'drafts')).removeEntry(name);await refresh()}},'Dismiss')));
+    const ta=el('textarea',{style:'min-height:200px'});ta.value=d.draft||'';
+    const fb=el('input',{placeholder:'What should change? (required to request a revision)'});
+    return el('div',{class:'card'},
+      el('strong',{},rid+' – '+S.agents[rid].role_title),
+      el('div',{class:'meta'},'Type: '+((S.agents[rid].authored_for_prototype.task_types.find(t=>t.id===d.task_type)||{}).label||d.task_type)+' · requested by '+(d.requester||'?')+' · '+(d.backend==='stub'?'STUB (no model)':'model draft')),
+      el('div',{},(d.flags||[]).map(f=>el('span',{class:'chip '+(/PHI|IDENTIFIER|NEEDS_ATTENTION/.test(f)?'bad':'warn')},f)),d.sops_unvalidated_on_record?el('span',{class:'chip warn'},d.sops_unvalidated_on_record+' SOP(s) on record not yet validated'):null),
+      el('details',{style:'margin:8px 0'},el('summary',{class:'meta'},'Original request'),el('div',{style:'white-space:pre-wrap;margin-top:6px'},d.instructions||'')),
+      el('label',{},'Draft (you can edit before approving)'),ta,
+      el('label',{},'Revision note'),fb,
+      el('div',{class:'actions'},
+        el('button',{class:'primary',onclick:async()=>{const who=$('who').value.trim();if(!who){banner('Enter your name at the top to approve.','bad');return}
+          const hits=phiScan(ta.value);if(hits.length&&!confirm('The text still matches identifier patterns ('+hits.join(', ')+'). Approve anyway?'))return;
+          await writeJSON(await sub(rid,'approved'),name,{...d,final_text:ta.value,approved_by:who,approved_at:new Date().toISOString(),status:'approved'});
+          await(await sub(rid,'drafts')).removeEntry(name);banner('Approved. Find it under "Approved".');await refresh()}},'Approve'),
+        el('button',{onclick:async()=>{if(!fb.value.trim()){banner('Add a revision note first.','bad');return}
+          const h=phiScan(fb.value);if(h.length){banner('Revision note has identifiers ('+h.join(', ')+').','bad');return}
+          const d2=new Date(),nid=base.replace(/-r\d+$/,'')+'-r'+(1+(parseInt((base.match(/-r(\d+)$/)||[0,0])[1])||0));
+          await writeJSON(await sub(rid,'inbox'),nid+'.json',{task_id:nid,role_id:rid,task_type:d.task_type,requester:d.requester,created:d2.toISOString(),due:d.due||'',tone:d.tone||'',instructions:d.instructions,feedback:fb.value.trim(),parent_id:base,status:'queued'});
+          await(await sub(rid,'drafts')).removeEntry(name);banner('Sent back for revision.');await refresh()}},'Request revision'),
+        el('button',{class:'danger',onclick:()=>discardDraft(rid,name,d)},'Discard')))}))}
+// Discard: first leave a metadata-only marker (no request or draft text) so usage reports can count it, then delete the draft.
+async function discardDraft(rid,name,d){
+  if(!confirm('Discard this draft?'))return;
+  const who=$('who').value.trim();if(!who){banner('Enter your name at the top to discard.','bad');return}
+  const base=name.replace(/\.json$/,'');
+  if(!/^[A-Za-z0-9_-]{1,80}$/.test(base)){banner('This draft has an unexpected file name and was not discarded.','bad');return}
+  try{
+    await writeJSON(await sub(rid,'archive'),base+'.discarded.json',{task_id:base,role_id:rid,task_type:(d&&d.task_type)||'',discarded_by:who,discarded_at:new Date().toISOString()});
+    await(await sub(rid,'drafts')).removeEntry(name)
+  }catch(e){banner('Could not discard: '+e.message,'bad');return}
+  await refresh()}
+function queueList(){const items=DATA.inbox.filter(matches);if(!items.length)return el('div',{class:'empty'},'Nothing waiting for the AI runner.');
+  return el('div',{},items.map(({data:d,rid})=>el('div',{class:'card'},el('strong',{},rid+' – '+S.agents[rid].role_title),el('div',{class:'meta'},'Queued '+(d.created||'')+' · '+(d.requester||'')+(d.parent_id?' · revision':'')),el('div',{style:'white-space:pre-wrap;margin-top:6px'},(d.instructions||'').slice(0,300)))))}
+function approvedList(){const items=DATA.approved.filter(matches);if(!items.length)return el('div',{class:'empty'},'Nothing approved yet.');
+  return el('div',{},items.map(({data:d,rid})=>{const ta=el('textarea',{readonly:true,style:'min-height:120px'});ta.value=d.final_text||'';
+    return el('div',{class:'card'},el('strong',{},rid+' – '+S.agents[rid].role_title),el('div',{class:'meta'},'Approved by '+(d.approved_by||'?')+' · '+(d.approved_at||'')),ta,
+      el('div',{class:'actions'},el('button',{onclick:async()=>{try{await navigator.clipboard.writeText(ta.value)}catch(_){ta.select();document.execCommand('copy')}banner('Copied.')}},'Copy text')))}))}
+
+async function refresh(){if(S.busy||!S.root)return;S.busy=true;try{DATA=await gather();await loadStatus();render(false);renderNotices();applyPausedToForm()}catch(e){banner('Could not read the folder: '+e.message,'bad')}finally{S.busy=false}}
+async function pick(){
+  try{S.root=await window.showDirectoryPicker({mode:'readwrite'});await loadAgents()}catch(e){if(e.name!=='AbortError')banner(e.message,'bad');return}
+  $('welcome').classList.add('hidden');$('app').classList.remove('hidden');$('pick').textContent='Change folder';
+  await refresh();render(true);clearInterval(S.timer);S.timer=setInterval(refresh,5000)}
+if(!window.showDirectoryPicker){$('unsupported').classList.remove('hidden');$('pick').disabled=true}
+$('pick').addEventListener('click',pick);
+window.__ws={pick,refresh,S,discardDraft,applyPausedToForm,statusInfo,newForm,renderNotices,loadStatus}; // for testing only; exposes nothing outside this page
+})();
+</script>
+</body>
+</html>

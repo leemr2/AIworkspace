@@ -1,0 +1,6 @@
+Place plain-text (.txt or .md) copies of the approved SOPs for this role here.
+The agent reads them as reference. Only add documents the owner has validated.
+SOPs listed in the workbook for this role:
+- Zel's Administrative Tasks for Dr. P  [Located SOP - owner validation pending]
+- SOP Calendar Management V2  [Located SOP - owner validation pending]
+- Standard Operating Procedure for Daily Clinical Intelligence Briefing Document  [Located SOP - owner validation pending]

@@ -1,0 +1,4 @@
+Place plain-text (.txt or .md) copies of the approved SOPs for this role here.
+The agent reads them as reference. Only add documents the owner has validated.
+SOPs listed in the workbook for this role:
+- Delegating from Dr. Perry to Practice Manager  [Legacy embedded SOP bundle - review before use]

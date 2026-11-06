@@ -1,0 +1,68 @@
+[
+ {
+  "decision": "Clinical diagnosis and treatment",
+  "owner": "Treating licensed optometrist / Medical Director",
+  "department": "Clinical Care",
+  "limit_or_note": "No administrative override"
+ },
+ {
+  "decision": "Doctor operational requests",
+  "owner": "Clinical Care Coordinator",
+  "department": "Clinical Care",
+  "limit_or_note": "Coordinate with Patient Access; clinical issues to Medical Director"
+ },
+ {
+  "decision": "Appointment booking and waitlist",
+  "owner": "Patient Access Lead",
+  "department": "Business Administration & Patient Experience",
+  "limit_or_note": "Changes to clinical templates require Clinical Care coordination"
+ },
+ {
+  "decision": "Front-desk complaints",
+  "owner": "Patient Relations / Service Recovery",
+  "department": "Business Administration & Patient Experience",
+  "limit_or_note": "Clinical complaints go to Clinical Care"
+ },
+ {
+  "decision": "Optical remakes and warranties",
+  "owner": "Optical Director / delegated specialist",
+  "department": "Optical",
+  "limit_or_note": "Clinical prescription concerns return to doctor"
+ },
+ {
+  "decision": "Medical and vision claims",
+  "owner": "Revenue Cycle Manager",
+  "department": "Business Administration & Patient Experience",
+  "limit_or_note": "Clinical coding requires provider-supported documentation"
+ },
+ {
+  "decision": "Frame purchasing",
+  "owner": "Optical Director / Frame Buyer",
+  "department": "Optical",
+  "limit_or_note": "Within approved purchase limits"
+ },
+ {
+  "decision": "Employee relations",
+  "owner": "Department Director + HR",
+  "department": "Shared",
+  "limit_or_note": "HR administers policy; CEO resolves director-level matters"
+ },
+ {
+  "decision": "Major spending, contracts, debt",
+  "owner": "CEO",
+  "department": "Executive",
+  "limit_or_note": "Requires CEO approval"
+ },
+ {
+  "decision": "Cross-department unresolved dispute",
+  "owner": "CEO",
+  "department": "Executive",
+  "limit_or_note": "Directors attempt resolution first"
+ },
+ {
+  "decision": "HIPAA privacy incident",
+  "owner": "Privacy & Security Officer",
+  "department": "Business Administration & Patient Experience",
+  "limit_or_note": "Coordinate with clinical leadership and counsel as needed"
+ }
+]
