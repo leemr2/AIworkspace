@@ -391,6 +391,17 @@ class T3_RequestGuards(Base):
         srv.app.locked_until = 0                          # pretend 5 minutes passed
         self.assertEqual(c.login(PIN)[0], 200)
 
+    @unittest.skipUnless(os.name == "nt", "Windows console prompt")
+    def test_windows_pin_prompt_shows_stars_and_handles_backspace(self):
+        keys = iter(list("12x\b3456") + ["\xe0", "H"] + list("78") + ["\r"])      # includes a backspace and an arrow key
+        fake = mock.Mock(getwch=lambda: next(keys))
+        with mock.patch.dict(sys.modules, {"msvcrt": fake}):
+            pin = admin.read_secret("PIN: ")
+        self.assertEqual(pin, "12345678")
+        shown = self.out.getvalue()
+        self.assertIn("********", shown.replace("\b \b", ""))
+        self.assertNotIn("12345678", shown)
+
     def test_pin_not_set_means_no_login(self):
         srv = self.start_server()
         self.assertEqual(self.client(srv).login("123456")[0], 409)

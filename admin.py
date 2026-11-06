@@ -743,14 +743,46 @@ def make_server(root, port=None):
 
 
 # =========================================================================== command line
+def read_secret(prompt):
+    """Read a PIN without echoing it. On Windows, show one '*' per key: the standard getpass shows
+    nothing at all there, which makes it look as if typing is not working."""
+    if os.name == "nt":
+        try:
+            import msvcrt
+        except ImportError:
+            return getpass.getpass(prompt)
+        sys.stdout.write(prompt)
+        sys.stdout.flush()
+        chars = []
+        while True:
+            ch = msvcrt.getwch()
+            if ch in ("\r", "\n"):
+                sys.stdout.write("\n")
+                return "".join(chars)
+            if ch == "\x03":
+                raise KeyboardInterrupt
+            if ch in ("\x00", "\xe0"):      # arrow / function key: swallow the second code
+                msvcrt.getwch()
+            elif ch == "\b":
+                if chars:
+                    chars.pop()
+                    sys.stdout.write("\b \b")
+            elif ch.isprintable():
+                chars.append(ch)
+                sys.stdout.write("*")
+            sys.stdout.flush()
+    return getpass.getpass(prompt)
+
+
 def set_pin_interactive(root):
     print("Set the Admin PIN: at least %d digits, numbers only. (It is stored only as a salted hash.)" % config.PIN_MIN_DIGITS)
+    print("Click in this window and type; you will see a * for each digit. Press Enter when done.")
     for _ in range(3):
-        a = getpass.getpass("New PIN: ")
+        a = read_secret("New PIN: ")
         if not config.valid_pin_format(a):
             print("That PIN is not valid: use at least %d digits, numbers only." % config.PIN_MIN_DIGITS)
             continue
-        if getpass.getpass("Type it again: ") != a:
+        if read_secret("Type it again: ") != a:
             print("The two entries did not match.")
             continue
         cfg = config.load(root)
