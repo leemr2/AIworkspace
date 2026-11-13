@@ -8,7 +8,7 @@ rem  the program that reads the API key.
 rem  Edit the next line so it points at the shared data folder
 rem  (the folder with the role inboxes, not this folder).
 rem ============================================================================
-set "WORKSPACE=C:\OfficeShare\AI-Workspace"
+set "WORKSPACE=Z:\AI-Workspace"
 rem ============================================================================
 
 cd /d "%~dp0"

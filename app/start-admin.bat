@@ -7,7 +7,7 @@ rem  Staff must not be able to edit this folder.
 rem  Edit the next line so it points at the shared data folder
 rem  (the folder with the role inboxes, not this folder).
 rem ============================================================================
-set "WORKSPACE=C:\OfficeShare\AI-Workspace"
+set "WORKSPACE=Z:\AI-Workspace"
 rem ============================================================================
 
 cd /d "%~dp0"

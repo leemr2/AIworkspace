@@ -23,7 +23,7 @@ Nothing is sent or published by an agent. A person approves every draft.
 
    `python init-workspace.py --dest D:\OfficeShare\AI-Workspace`
 
-   Or copy the `workspace-template` folder by hand. You get the seven `_agents` configs, empty role folders (each with a `.keep` file), and `_sops` placeholders.
+   Or copy the `workspace-template` folder by hand, paste it on the destination drive, rename folder to "AI-Workspace" on the shared drive. You get the seven `_agents` configs, empty role folders (each with a `.keep` file), and `_sops` placeholders.
 3. Edit the `WORKSPACE=` line at the top of `start-runner.bat` / `start-runner.command` and the matching admin launcher so it points at that shared folder. The launchers run the scripts from their own folder. Leave the launchers in the program folder.
 4. On the runner computer (Python 3.9+), double-click **`start-runner.bat`** (Windows) or **`start-runner.command`** (Mac). Until you choose a real provider on the Admin page, it uses a **stub** model, so you can try the workflow with no AI and no cost. The first time, when no settings folder exists yet, only the stub is allowed.
 5. Put `dashboard/dashboard.html` where staff can open it but not edit it. On a staff computer, open it in **Chrome or Edge**, click **Choose workspace folder**, and pick the shared workspace (the folder that contains `_agents` and the role folders).
